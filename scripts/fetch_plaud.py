@@ -285,7 +285,10 @@ class PlaudClient:
         return entries
 
     def _download_payload(self, url: str) -> Any:
-        response = self.session.get(url, timeout=60)
+        # `data_link` from Plaud detail is a presigned S3 URL.
+        # It must be fetched without the Plaud bearer header, otherwise S3
+        # rejects the request because two auth mechanisms are present.
+        response = requests.get(url, timeout=60)
         response.raise_for_status()
         content = response.content
         if url.endswith(".gz") or content[:2] == b"\x1f\x8b":
