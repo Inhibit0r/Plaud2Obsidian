@@ -17,6 +17,53 @@ if str(SCRIPT_DIR) not in sys.path:
 from common import RAW_DIR, ensure_dir, normalize_date, read_json, sanitize_filename, utc_now_iso, write_json
 
 
+def _coerce_duration_seconds(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    if numeric >= 10000:
+        return max(numeric // 1000, 0)
+    return max(numeric, 0)
+
+
+def _coerce_sort_timestamp(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    if numeric <= 0:
+        return 0
+    if numeric > 10_000_000_000:
+        return numeric
+    return numeric * 1000
+
+
+def _normalize_timestamp_value(value: Any) -> str:
+    numeric = _coerce_sort_timestamp(value)
+    if not numeric:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(numeric / 1000))
+
+
+def _normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for segment in segments:
+        normalized.append(
+            {
+                "start": _coerce_duration_seconds(segment.get("start")),
+                "end": _coerce_duration_seconds(segment.get("end")),
+                "speaker": segment.get("speaker"),
+                "text": segment.get("text"),
+            }
+        )
+    return normalized
+
+
 class PlaudClient:
     def __init__(self, token: str, api_domain: str) -> None:
         self.token = token
@@ -27,13 +74,55 @@ class PlaudClient:
     def get_json(self, endpoint: str) -> Any:
         response = self.session.get(f"{self.api_domain}{endpoint}", timeout=60)
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        redirected_domain = self._extract_redirect_domain(data)
+        if redirected_domain and redirected_domain != self.api_domain:
+            self.api_domain = redirected_domain
+            response = self.session.get(f"{self.api_domain}{endpoint}", timeout=60)
+            response.raise_for_status()
+            data = response.json()
+        return data
+
+    @staticmethod
+    def _extract_redirect_domain(data: Any) -> str | None:
+        if not isinstance(data, dict):
+            return None
+        if data.get("status") != -302:
+            return None
+        domains = data.get("data", {}).get("domains", {})
+        api_domain = str(domains.get("api") or "").strip()
+        return api_domain.rstrip("/") or None
+
+    @staticmethod
+    def _extract_list_payload(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict) and isinstance(data.get("data_file_list"), list):
+            return [item for item in data["data_file_list"] if isinstance(item, dict)]
+        raise RuntimeError(f"Unexpected list response: {data}")
+
+    @staticmethod
+    def _normalize_list_item(item: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(item)
+        normalized["name"] = (
+            str(item.get("name") or item.get("filename") or item.get("fullname") or "Untitled recording").strip()
+            or "Untitled recording"
+        )
+        normalized["create_time"] = _normalize_timestamp_value(
+            item.get("create_time") or item.get("start_time") or item.get("version_ms") or item.get("edit_time")
+        )
+        normalized["sort_ts"] = _coerce_sort_timestamp(
+            item.get("start_time") or item.get("version_ms") or item.get("edit_time") or item.get("create_time")
+        )
+        normalized["duration"] = _coerce_duration_seconds(item.get("duration"))
+        if "status" not in normalized:
+            normalized["status"] = "done" if item.get("is_trans") or item.get("is_summary") else "pending"
+        return normalized
 
     def list_recordings(self) -> list[dict[str, Any]]:
         data = self.get_json("/file/simple/web")
-        if not isinstance(data, list):
-            raise RuntimeError(f"Unexpected list response: {data}")
-        return data
+        recordings = self._extract_list_payload(data)
+        return [self._normalize_list_item(item) for item in recordings]
 
     def get_detail(self, file_id: str) -> dict[str, Any]:
         data = self.get_json(f"/file/detail/{file_id}")
@@ -52,21 +141,19 @@ def load_client() -> PlaudClient:
 
 
 def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_domain: str) -> dict[str, Any]:
-    segments = detail.get("trans_result", {}).get("segments", []) or []
+    list_item = PlaudClient._normalize_list_item(list_item)
+    raw_segments = detail.get("trans_result", {}).get("segments", []) or []
+    segments = _normalize_segments([segment for segment in raw_segments if isinstance(segment, dict)])
     transcript_parts = [str(segment.get("text", "")).strip() for segment in segments if segment.get("text")]
     speakers = []
     for segment in segments:
         speaker = str(segment.get("speaker", "")).strip()
         if speaker and speaker not in speakers:
             speakers.append(speaker)
-    create_time = detail.get("create_time") or list_item.get("create_time") or ""
-    ai_content = detail.get("ai_content")
-    if isinstance(ai_content, str):
-        summary = ai_content
-    elif ai_content:
-        summary = str(ai_content)
-    else:
-        summary = ""
+    create_time = _normalize_timestamp_value(detail.get("create_time")) or list_item.get("create_time") or ""
+    ai_content = detail.get("ai_content") or detail.get("summary") or detail.get("ai_summary")
+    summary = str(ai_content).strip() if ai_content else ""
+    duration = _coerce_duration_seconds(detail.get("duration")) or int(list_item.get("duration") or 0)
     return {
         "schema_version": 1,
         "fetched_at": utc_now_iso(),
@@ -75,21 +162,14 @@ def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_d
             "file_id": list_item.get("id"),
             "status": detail.get("status") or list_item.get("status"),
         },
-        "name": detail.get("name") or list_item.get("name") or "Untitled recording",
+        "name": str(detail.get("name") or detail.get("filename") or list_item.get("name") or "Untitled recording").strip()
+        or "Untitled recording",
         "date": normalize_date(create_time),
         "create_time": create_time,
-        "duration": detail.get("duration") or list_item.get("duration") or 0,
+        "duration": duration,
         "summary": summary,
         "transcript": " ".join(transcript_parts).strip(),
-        "segments": [
-            {
-                "start": segment.get("start"),
-                "end": segment.get("end"),
-                "speaker": segment.get("speaker"),
-                "text": segment.get("text"),
-            }
-            for segment in segments
-        ],
+        "segments": segments,
         "speakers": speakers,
     }
 
@@ -119,7 +199,7 @@ def fetch_and_save_recording(
 
 def select_recordings(recordings: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     filtered = [item for item in recordings if str(item.get("status", "")).lower() in {"done", "completed", ""}]
-    sorted_items = sorted(filtered, key=lambda item: item.get("create_time") or "", reverse=True)
+    sorted_items = sorted(filtered, key=lambda item: int(item.get("sort_ts") or 0), reverse=True)
     return sorted_items[:limit] if limit else sorted_items
 
 
