@@ -1,0 +1,11 @@
+[Unit]
+Description=Plaud2Obsidian one-shot ingest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Plaud2Obsidian
+EnvironmentFile=/opt/Plaud2Obsidian/.env
+ExecStart=/bin/bash -lc 'source .venv/bin/activate && python scripts/openclaw_router.py ingest --latest 1'
+Nice=10

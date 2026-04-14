@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Plaud2Obsidian ingest every 15 minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=15m
+Unit=plaud2obsidian-ingest.service
+
+[Install]
+WantedBy=timers.target
+
