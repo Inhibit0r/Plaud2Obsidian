@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import sys
@@ -87,32 +88,76 @@ def _normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _iter_nodes(value: Any) -> Any:
+    parsed = _parse_maybe_json(value)
+    yield parsed
+    if isinstance(parsed, dict):
+        for child in parsed.values():
+            yield from _iter_nodes(child)
+    elif isinstance(parsed, list):
+        for child in parsed:
+            yield from _iter_nodes(child)
+
+
+def _collapse_text(value: Any) -> str:
+    parsed = _parse_maybe_json(value)
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, list):
+        parts = [_collapse_text(item) for item in parsed]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(parsed, dict):
+        prioritized_keys = ("title", "summary", "content", "text", "note", "description")
+        parts: list[str] = []
+        seen: set[str] = set()
+        for key in prioritized_keys:
+            if key not in parsed:
+                continue
+            part = _collapse_text(parsed.get(key))
+            if part and part not in seen:
+                seen.add(part)
+                parts.append(part)
+        for key, raw_value in parsed.items():
+            if key in prioritized_keys:
+                continue
+            part = _collapse_text(raw_value)
+            if part and part not in seen:
+                seen.add(part)
+                parts.append(part)
+        return "\n".join(parts).strip()
+    if parsed is None:
+        return ""
+    return str(parsed).strip()
+
+
 def _extract_segments(detail: dict[str, Any]) -> list[dict[str, Any]]:
-    candidate = _parse_maybe_json(detail.get("trans_result"))
-    if isinstance(candidate, dict) and isinstance(candidate.get("segments"), list):
-        return _normalize_segments([segment for segment in candidate["segments"] if isinstance(segment, dict)])
-    if isinstance(candidate, list):
-        return _normalize_segments([segment for segment in candidate if isinstance(segment, dict)])
-    for key in ("segments", "trans_segments", "speaker_segments"):
-        value = _parse_maybe_json(detail.get(key))
-        if isinstance(value, list):
-            return _normalize_segments([segment for segment in value if isinstance(segment, dict)])
+    for node in _iter_nodes(detail):
+        if not isinstance(node, dict):
+            continue
+        candidate = _parse_maybe_json(node.get("trans_result"))
+        if isinstance(candidate, dict) and isinstance(candidate.get("segments"), list):
+            return _normalize_segments([segment for segment in candidate["segments"] if isinstance(segment, dict)])
+        if isinstance(candidate, list):
+            return _normalize_segments([segment for segment in candidate if isinstance(segment, dict)])
+        for key in ("segments", "trans_segments", "speaker_segments", "utterances", "paragraphs", "sentence_list"):
+            value = _parse_maybe_json(node.get(key))
+            if isinstance(value, list):
+                normalized = _normalize_segments([segment for segment in value if isinstance(segment, dict)])
+                if any(segment.get("text") for segment in normalized):
+                    return normalized
     return []
 
 
 def _extract_summary(detail: dict[str, Any]) -> str:
-    for key in ("ai_content", "summary", "ai_summary", "note_content", "note"):
-        value = _parse_maybe_json(detail.get(key))
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if isinstance(value, dict):
-            parts = [str(item).strip() for item in value.values() if str(item).strip()]
-            if parts:
-                return "\n".join(parts)
-        if isinstance(value, list):
-            parts = [str(item).strip() for item in value if str(item).strip()]
-            if parts:
-                return "\n".join(parts)
+    for node in _iter_nodes(detail):
+        if not isinstance(node, dict):
+            continue
+        for key in ("ai_content", "summary", "ai_summary", "note_content", "note", "abstract", "memo"):
+            if key not in node:
+                continue
+            text = _collapse_text(node.get(key))
+            if text:
+                return text
     return ""
 
 
@@ -120,11 +165,17 @@ def _extract_transcript(detail: dict[str, Any], segments: list[dict[str, Any]]) 
     if segments:
         parts = [str(segment.get("text", "")).strip() for segment in segments if segment.get("text")]
         return " ".join(parts).strip()
-    for key in ("transcript", "transcription", "trans_content", "text", "content"):
-        value = detail.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
+    best = ""
+    for node in _iter_nodes(detail):
+        if not isinstance(node, dict):
+            continue
+        for key in ("transcript", "transcription", "trans_content", "text", "content", "full_text"):
+            if key not in node:
+                continue
+            text = _collapse_text(node.get(key))
+            if len(text) > len(best):
+                best = text
+    return best
 
 
 class PlaudClient:
@@ -190,8 +241,63 @@ class PlaudClient:
     def get_detail(self, file_id: str) -> dict[str, Any]:
         data = self.get_json(f"/file/detail/{file_id}")
         if isinstance(data, dict) and "data" in data:
-            return data["data"] or {}
+            detail = data["data"] or {}
+            if isinstance(detail, dict):
+                return self._expand_detail_content(detail)
+            return {}
         raise RuntimeError(f"Unexpected detail response for {file_id}: {data}")
+
+    def _expand_detail_content(self, detail: dict[str, Any]) -> dict[str, Any]:
+        entries = self._extract_download_entries(detail)
+        if not entries:
+            return detail
+        downloaded: list[dict[str, Any]] = []
+        for entry in entries:
+            data_link = str(entry.get("data_link") or entry.get("download_link") or entry.get("url") or "").strip()
+            if not data_link:
+                continue
+            payload = self._download_payload(data_link)
+            if payload is None:
+                continue
+            downloaded.append({"meta": entry, "payload": payload})
+        if not downloaded:
+            return detail
+        enriched = dict(detail)
+        enriched["_downloaded_content"] = downloaded
+        return enriched
+
+    @staticmethod
+    def _extract_download_entries(detail: dict[str, Any]) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for key in ("content_list", "pre_download_content_list"):
+            raw_entries = detail.get(key)
+            if not isinstance(raw_entries, list):
+                continue
+            for item in raw_entries:
+                if not isinstance(item, dict):
+                    continue
+                data_link = str(item.get("data_link") or item.get("download_link") or item.get("url") or "").strip()
+                if not data_link or data_link in seen:
+                    continue
+                seen.add(data_link)
+                entries.append(item)
+        return entries
+
+    def _download_payload(self, url: str) -> Any:
+        response = self.session.get(url, timeout=60)
+        response.raise_for_status()
+        content = response.content
+        if url.endswith(".gz") or content[:2] == b"\x1f\x8b":
+            try:
+                content = gzip.decompress(content)
+            except OSError:
+                pass
+        text = content.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None
+        parsed = _parse_maybe_json(text)
+        return parsed
 
 
 def load_client() -> PlaudClient:
