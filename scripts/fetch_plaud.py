@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +46,31 @@ def _coerce_sort_timestamp(value: Any) -> int:
 
 
 def _normalize_timestamp_value(value: Any) -> str:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return raw
     numeric = _coerce_sort_timestamp(value)
     if not numeric:
         return ""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(numeric / 1000))
+
+
+def _parse_maybe_json(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if not raw or raw[0] not in "[{":
+        return value
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return value
 
 
 def _normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -62,6 +85,46 @@ def _normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
+
+def _extract_segments(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    candidate = _parse_maybe_json(detail.get("trans_result"))
+    if isinstance(candidate, dict) and isinstance(candidate.get("segments"), list):
+        return _normalize_segments([segment for segment in candidate["segments"] if isinstance(segment, dict)])
+    if isinstance(candidate, list):
+        return _normalize_segments([segment for segment in candidate if isinstance(segment, dict)])
+    for key in ("segments", "trans_segments", "speaker_segments"):
+        value = _parse_maybe_json(detail.get(key))
+        if isinstance(value, list):
+            return _normalize_segments([segment for segment in value if isinstance(segment, dict)])
+    return []
+
+
+def _extract_summary(detail: dict[str, Any]) -> str:
+    for key in ("ai_content", "summary", "ai_summary", "note_content", "note"):
+        value = _parse_maybe_json(detail.get(key))
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            parts = [str(item).strip() for item in value.values() if str(item).strip()]
+            if parts:
+                return "\n".join(parts)
+        if isinstance(value, list):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def _extract_transcript(detail: dict[str, Any], segments: list[dict[str, Any]]) -> str:
+    if segments:
+        parts = [str(segment.get("text", "")).strip() for segment in segments if segment.get("text")]
+        return " ".join(parts).strip()
+    for key in ("transcript", "transcription", "trans_content", "text", "content"):
+        value = detail.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 class PlaudClient:
@@ -142,17 +205,15 @@ def load_client() -> PlaudClient:
 
 def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_domain: str) -> dict[str, Any]:
     list_item = PlaudClient._normalize_list_item(list_item)
-    raw_segments = detail.get("trans_result", {}).get("segments", []) or []
-    segments = _normalize_segments([segment for segment in raw_segments if isinstance(segment, dict)])
-    transcript_parts = [str(segment.get("text", "")).strip() for segment in segments if segment.get("text")]
+    segments = _extract_segments(detail)
+    transcript = _extract_transcript(detail, segments)
     speakers = []
     for segment in segments:
         speaker = str(segment.get("speaker", "")).strip()
         if speaker and speaker not in speakers:
             speakers.append(speaker)
     create_time = _normalize_timestamp_value(detail.get("create_time")) or list_item.get("create_time") or ""
-    ai_content = detail.get("ai_content") or detail.get("summary") or detail.get("ai_summary")
-    summary = str(ai_content).strip() if ai_content else ""
+    summary = _extract_summary(detail)
     duration = _coerce_duration_seconds(detail.get("duration")) or int(list_item.get("duration") or 0)
     return {
         "schema_version": 1,
@@ -168,7 +229,7 @@ def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_d
         "create_time": create_time,
         "duration": duration,
         "summary": summary,
-        "transcript": " ".join(transcript_parts).strip(),
+        "transcript": transcript,
         "segments": segments,
         "speakers": speakers,
     }
