@@ -19,13 +19,14 @@ from common import (
     clean_tags,
     load_text,
     normalize_date,
+    raw_source_link,
     read_json,
     seconds_to_timestamp,
     utc_now_iso,
-    wiki_source_link,
     write_json,
 )
 from llm_client import LLMError, chat_json
+from routing import build_record_routing_context
 from wiki_context import build_ingest_context, render_note_context_block
 
 
@@ -67,6 +68,8 @@ def build_prompt(record: dict[str, Any], raw_filename: str, existing_context: di
     transcript_excerpt = build_transcript_excerpt(record, max_chars=max_chars)
     inventory = existing_context.get("inventory", {})
     relevant_notes = existing_context.get("relevant_notes", [])
+    routing_context = existing_context.get("routing", {})
+    folder_inventory = existing_context.get("folder_inventory", [])
     system_prompt = (
         "Ты аккуратный knowledge-engineering агент. "
         "Верни только валидный JSON без пояснений и markdown."
@@ -96,15 +99,23 @@ def build_prompt(record: dict[str, Any], raw_filename: str, existing_context: di
 Наиболее релевантные существующие заметки:
 {render_note_context_block(relevant_notes)}
 
+Routing context:
+- plaud_tag_names: {routing_context.get("plaud_tag_names", [])}
+- mapped_roots: {routing_context.get("mapped_roots", [])}
+- suggested_folders_by_type: {routing_context.get("suggested_folders_by_type", {})}
+- allow_new_folders: {routing_context.get("allow_new_folders")}
+- existing_folders_in_vault: {folder_inventory}
+
 Исходная запись:
 - raw_filename: {raw_filename}
-- source_link: {wiki_source_link(raw_filename)}
+- source_link: {raw_source_link(raw_filename)}
 - file_id: {record.get("plaud", {}).get("file_id")}
 - title: {record.get("name")}
 - date: {record.get("date")}
 - create_time: {record.get("create_time")}
 - duration_seconds: {record.get("duration")}
 - speakers: {record.get("speakers", [])}
+- plaud_tag_names: {record.get("plaud", {}).get("filetag_names", [])}
 
 Plaud AI summary:
 {record.get("summary", "") or "(empty)"}
@@ -118,6 +129,7 @@ Transcript excerpt:
   "meeting": null | {{
     "title": "string",
     "summary": "string",
+    "folder": "relative path inside vault, e.g. meetings or domains/work/meetings",
     "participants": ["existing or new person title"],
     "projects": ["existing or new project title"],
     "ideas": ["idea title"],
@@ -131,6 +143,7 @@ Transcript excerpt:
     {{
       "title": "string",
       "existing_title": "string|null",
+      "folder": "relative path inside vault",
       "summary": "string",
       "role": "string",
       "facts": ["bullet"],
@@ -142,6 +155,7 @@ Transcript excerpt:
     {{
       "title": "string",
       "existing_title": "string|null",
+      "folder": "relative path inside vault",
       "summary": "string",
       "status": "string",
       "facts": ["bullet"],
@@ -153,6 +167,7 @@ Transcript excerpt:
     {{
       "title": "string",
       "existing_title": "string|null",
+      "folder": "relative path inside vault",
       "summary": "string",
       "details": ["bullet"],
       "related_titles": ["note title"],
@@ -163,6 +178,7 @@ Transcript excerpt:
     {{
       "title": "string",
       "existing_title": "string|null",
+      "folder": "relative path inside vault",
       "summary": "string",
       "details": ["bullet"],
       "related_titles": ["note title"],
@@ -174,6 +190,9 @@ Transcript excerpt:
 Дополнительные требования:
 - Не копируй длинные фрагменты транскрипта дословно.
 - Используй `existing_title`, только если сущность уже есть в vault и это точно тот же объект.
+- Поле `folder` должно быть относительным путём внутри `vault/`.
+- Предпочитай уже существующие папки.
+- Новую папку создавай только если Plaud tags и содержание записи дают сильный сигнал, что нужен новый раздел.
 - Для `meeting.title` делай конкретный human-readable заголовок.
 - Если запись не похожа на встречу, `meeting` можно вернуть как null.
 - Для слабых упоминаний не создавай сущности.
@@ -187,6 +206,7 @@ def fallback_plan(record: dict[str, Any], raw_filename: str) -> dict[str, Any]:
     transcript = str(record.get("transcript", "")).strip()
     source_kind = "meeting" if len(record.get("speakers") or []) > 1 else "idea"
     source_title = str(record.get("name") or "Без названия").strip() or "Без названия"
+    routing_context = build_record_routing_context(record)
     highlights: list[str] = []
     if summary:
         highlights.append(summary[:300].strip())
@@ -196,6 +216,7 @@ def fallback_plan(record: dict[str, Any], raw_filename: str) -> dict[str, Any]:
         meeting = {
             "title": source_title,
             "summary": summary or transcript[:500] or "Запись из Plaud без AI-summary.",
+            "folder": routing_context.get("suggested_folders_by_type", {}).get("meeting"),
             "participants": [str(speaker).strip() for speaker in (record.get("speakers") or []) if str(speaker).strip()],
             "projects": [],
             "ideas": [],
@@ -222,6 +243,7 @@ def fallback_plan(record: dict[str, Any], raw_filename: str) -> dict[str, Any]:
     idea = {
         "title": source_title,
         "existing_title": None,
+        "folder": routing_context.get("suggested_folders_by_type", {}).get("idea"),
         "summary": summary or transcript[:500] or "Голосовая заметка из Plaud.",
         "details": highlights[:4],
         "related_titles": [],
@@ -257,6 +279,7 @@ def _normalize_note_items(
             {
                 "title": str(item.get("title") or title).strip() or title,
                 "existing_title": str(item.get("existing_title") or "").strip() or None,
+                "folder": str(item.get("folder") or "").strip() or None,
                 "summary": str(item.get("summary", "")).strip(),
                 "role": str(item.get("role", "")).strip(),
                 "status": str(item.get("status", "")).strip(),
@@ -278,6 +301,7 @@ def validate_plan(plan: dict[str, Any], record: dict[str, Any], raw_filename: st
         meeting_normalized = {
             "title": str(meeting.get("title")).strip(),
             "summary": str(meeting.get("summary", "")).strip(),
+            "folder": str(meeting.get("folder") or "").strip() or None,
             "participants": [str(value).strip() for value in meeting.get("participants", []) if str(value).strip()],
             "projects": [str(value).strip() for value in meeting.get("projects", []) if str(value).strip()],
             "ideas": [str(value).strip() for value in meeting.get("ideas", []) if str(value).strip()],
@@ -307,10 +331,11 @@ def validate_plan(plan: dict[str, Any], record: dict[str, Any], raw_filename: st
             "used_fallback": bool(plan.get("meta", {}).get("used_fallback", False)),
             "generated_at": utc_now_iso(),
             "raw_filename": raw_filename,
-            "source_link": wiki_source_link(raw_filename),
+            "source_link": raw_source_link(raw_filename),
             "source_title": str(record.get("name") or "").strip(),
             "source_date": normalize_date(record.get("date") or record.get("create_time")),
             "file_id": record.get("plaud", {}).get("file_id"),
+            "routing": build_record_routing_context(record),
         },
     }
 

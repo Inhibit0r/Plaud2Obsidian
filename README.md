@@ -4,7 +4,7 @@
 
 1. Забирает готовые транскрипции из Plaud в `raw/`.
 2. Строит план атомизации под правила из `AGENTS.md`.
-3. Создаёт и обновляет заметки в `wiki/`.
+3. Создаёт и обновляет заметки в `vault/`.
 4. Обновляет `index.md` и `log.md`.
 
 ## Быстрый старт
@@ -45,7 +45,8 @@ python3 scripts/run_ingest.py --raw-file raw/2026-04-14__Example__abc123.json
 - `raw/*.json` — канонические выгрузки Plaud
 - `.state/processed.json` — реестр уже обработанных source
 - `.state/plans/*.plan.json` — сохранённые планы атомизации
-- `wiki/**/*.md` — итоговые заметки
+- `vault/**/*.md` — итоговые заметки
+- `config/plaud_folder_map.yaml` — mapping Plaud tags/folders -> vault roots
 
 ## Важные замечания
 
@@ -101,7 +102,7 @@ python scripts/run_ingest.py --latest 1
 python scripts/run_ingest.py --latest 1 --dry-run
 ```
 
-OpenClaw в такой схеме становится только orchestration-слоем. Инжест, запись в `wiki/`, `index.md`, `log.md` и работа с Plaud остаются внутри этого репозитория.
+OpenClaw в такой схеме становится orchestration- и reasoning-слоем. Инжест, запись в `vault/`, `index.md`, `log.md` и работа с Plaud остаются внутри этого репозитория.
 
 ## OpenClaw-ready router
 
@@ -120,6 +121,23 @@ python scripts/openclaw_router.py lint
 Этот router:
 
 - возвращает JSON, который OpenClaw может разбирать без markdown-парсинга;
-- для ingest подмешивает `CONTEXT.md`, `AGENTS.md`, `index.md` и релевантные существующие `wiki/` заметки в planning prompt;
+- для ingest подмешивает `CONTEXT.md`, `AGENTS.md`, `index.md`, routing config и релевантные существующие `vault/` заметки в planning prompt;
 - поддерживает brain-mode: OpenClaw может сам запросить `ingest-context`, сам построить план и затем применить его через `apply-plan`;
 - позволяет OpenClaw быть orchestration-мозгом, а репозиторию оставаться долговременной памятью и deterministic execution layer.
+
+## Vault routing
+
+Текущий write-target — `vault/`, а не `wiki/`.
+
+Базовая структура:
+
+- `vault/people`
+- `vault/projects`
+- `vault/ideas`
+- `vault/concepts`
+- `vault/meetings`
+- `vault/synthesis`
+- `vault/inbox`
+- `vault/domains/*`
+
+Plaud folder/tag metadata подтягивается через `/filetag/` и сохраняется в raw metadata. Mapping задаётся в `config/plaud_folder_map.yaml`.

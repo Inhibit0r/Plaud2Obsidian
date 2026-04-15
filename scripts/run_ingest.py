@@ -23,6 +23,10 @@ def collect_raw_files(args: argparse.Namespace) -> list[Path]:
 
     client = load_client()
     recordings = client.list_recordings()
+    try:
+        tag_name_map = client.get_tag_name_map()
+    except Exception:
+        tag_name_map = {}
 
     if args.file_id:
         selected = [item for item in recordings if str(item.get("id")) == args.file_id]
@@ -34,7 +38,15 @@ def collect_raw_files(args: argparse.Namespace) -> list[Path]:
 
     raw_files: list[Path] = []
     for item in selected:
-        raw_files.append(fetch_and_save_recording(client, item, raw_dir=RAW_DIR, refresh=args.refresh_raw))
+        raw_files.append(
+            fetch_and_save_recording(
+                client,
+                item,
+                raw_dir=RAW_DIR,
+                refresh=args.refresh_raw,
+                tag_name_map=tag_name_map,
+            )
+        )
     return raw_files
 
 

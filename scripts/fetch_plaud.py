@@ -74,6 +74,23 @@ def _parse_maybe_json(value: Any) -> Any:
         return value
 
 
+def _coerce_string_list(value: Any) -> list[str]:
+    parsed = _parse_maybe_json(value)
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    if isinstance(parsed, str):
+        raw = parsed.strip()
+        if not raw:
+            return []
+        if "," in raw:
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return [raw]
+    text = str(parsed).strip()
+    return [text] if text else []
+
+
 def _normalize_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for segment in segments:
@@ -128,6 +145,53 @@ def _collapse_text(value: Any) -> str:
     if parsed is None:
         return ""
     return str(parsed).strip()
+
+
+def _extract_tag_entries(value: Any) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def walk(node: Any) -> None:
+        parsed = _parse_maybe_json(node)
+        if isinstance(parsed, list):
+            for item in parsed:
+                walk(item)
+            return
+        if not isinstance(parsed, dict):
+            return
+
+        tag_id = parsed.get("id") or parsed.get("filetag_id") or parsed.get("tag_id") or parsed.get("folder_id")
+        tag_name = (
+            parsed.get("name")
+            or parsed.get("filetag_name")
+            or parsed.get("tag_name")
+            or parsed.get("folder_name")
+            or parsed.get("title")
+        )
+        tag_id_text = str(tag_id).strip() if tag_id is not None else ""
+        tag_name_text = str(tag_name).strip() if tag_name is not None else ""
+        if tag_id_text and tag_name_text and tag_id_text not in seen:
+            seen.add(tag_id_text)
+            entries.append({"id": tag_id_text, "name": tag_name_text})
+
+        for child in parsed.values():
+            walk(child)
+
+    walk(value)
+    return entries
+
+
+def _extract_tag_ids(*values: Any) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        for candidate in _coerce_string_list(value):
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(candidate)
+    return result
 
 
 def _extract_segments(detail: dict[str, Any]) -> list[dict[str, Any]]:
@@ -229,6 +293,11 @@ class PlaudClient:
             item.get("start_time") or item.get("version_ms") or item.get("edit_time") or item.get("create_time")
         )
         normalized["duration"] = _coerce_duration_seconds(item.get("duration"))
+        normalized["filetag_ids"] = _extract_tag_ids(
+            item.get("filetag_id_list"),
+            item.get("tag_id_list"),
+            item.get("file_tag_id_list"),
+        )
         if "status" not in normalized:
             normalized["status"] = "done" if item.get("is_trans") or item.get("is_summary") else "pending"
         return normalized
@@ -237,6 +306,12 @@ class PlaudClient:
         data = self.get_json("/file/simple/web")
         recordings = self._extract_list_payload(data)
         return [self._normalize_list_item(item) for item in recordings]
+
+    def get_file_tags(self) -> Any:
+        return self.get_json("/filetag/")
+
+    def get_tag_name_map(self) -> dict[str, str]:
+        return {entry["id"]: entry["name"] for entry in _extract_tag_entries(self.get_file_tags())}
 
     def get_detail(self, file_id: str) -> dict[str, Any]:
         data = self.get_json(f"/file/detail/{file_id}")
@@ -312,7 +387,12 @@ def load_client() -> PlaudClient:
     return PlaudClient(token=token, api_domain=api_domain)
 
 
-def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_domain: str) -> dict[str, Any]:
+def build_raw_recording(
+    list_item: dict[str, Any],
+    detail: dict[str, Any],
+    api_domain: str,
+    tag_name_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
     list_item = PlaudClient._normalize_list_item(list_item)
     segments = _extract_segments(detail)
     transcript = _extract_transcript(detail, segments)
@@ -324,6 +404,23 @@ def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_d
     create_time = _normalize_timestamp_value(detail.get("create_time")) or list_item.get("create_time") or ""
     summary = _extract_summary(detail)
     duration = _coerce_duration_seconds(detail.get("duration")) or int(list_item.get("duration") or 0)
+    filetag_ids = _extract_tag_ids(
+        detail.get("filetag_id_list"),
+        detail.get("tag_id_list"),
+        detail.get("file_tag_id_list"),
+        list_item.get("filetag_ids"),
+    )
+    resolved_tag_names: list[str] = []
+    seen_names: set[str] = set()
+    for tag_id in filetag_ids:
+        tag_name = str((tag_name_map or {}).get(tag_id, "")).strip()
+        if not tag_name:
+            continue
+        key = tag_name.casefold()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        resolved_tag_names.append(tag_name)
     return {
         "schema_version": 1,
         "fetched_at": utc_now_iso(),
@@ -331,6 +428,8 @@ def build_raw_recording(list_item: dict[str, Any], detail: dict[str, Any], api_d
             "api_domain": api_domain,
             "file_id": list_item.get("id"),
             "status": detail.get("status") or list_item.get("status"),
+            "filetag_ids": filetag_ids,
+            "filetag_names": resolved_tag_names,
         },
         "name": str(detail.get("name") or detail.get("filename") or list_item.get("name") or "Untitled recording").strip()
         or "Untitled recording",
@@ -356,9 +455,10 @@ def fetch_and_save_recording(
     list_item: dict[str, Any],
     raw_dir: Path,
     refresh: bool = False,
+    tag_name_map: dict[str, str] | None = None,
 ) -> Path:
     detail = client.get_detail(str(list_item["id"]))
-    record = build_raw_recording(list_item, detail, api_domain=client.api_domain)
+    record = build_raw_recording(list_item, detail, api_domain=client.api_domain, tag_name_map=tag_name_map)
     filename = raw_filename_for_recording(record)
     target_path = raw_dir / filename
     if target_path.exists() and not refresh:
@@ -376,8 +476,20 @@ def select_recordings(recordings: list[dict[str, Any]], limit: int | None = None
 def command_list(args: argparse.Namespace) -> int:
     client = load_client()
     recordings = select_recordings(client.list_recordings(), limit=args.limit)
+    try:
+        tag_name_map = client.get_tag_name_map()
+    except Exception:
+        tag_name_map = {}
     for item in recordings:
-        print(f"{item.get('id')}\t{item.get('create_time')}\t{item.get('name')}")
+        tag_hint = ",".join(tag_name_map.get(tag_id, tag_id) for tag_id in (item.get("filetag_ids") or []))
+        suffix = f"\t{tag_hint}" if tag_hint else ""
+        print(f"{item.get('id')}\t{item.get('create_time')}\t{item.get('name')}{suffix}")
+    return 0
+
+
+def command_tags(_: argparse.Namespace) -> int:
+    client = load_client()
+    print(json.dumps(client.get_file_tags(), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -385,6 +497,10 @@ def command_fetch(args: argparse.Namespace) -> int:
     client = load_client()
     ensure_dir(RAW_DIR)
     recordings = client.list_recordings()
+    try:
+        tag_name_map = client.get_tag_name_map()
+    except Exception:
+        tag_name_map = {}
 
     if args.file_id:
         candidate = next((item for item in recordings if str(item.get("id")) == args.file_id), None)
@@ -397,7 +513,7 @@ def command_fetch(args: argparse.Namespace) -> int:
     saved: list[Path] = []
     for index, item in enumerate(selected, start=1):
         print(f"[{index}/{len(selected)}] fetching {item.get('name')} ({item.get('id')})")
-        path = fetch_and_save_recording(client, item, RAW_DIR, refresh=args.refresh)
+        path = fetch_and_save_recording(client, item, RAW_DIR, refresh=args.refresh, tag_name_map=tag_name_map)
         saved.append(path)
         if index < len(selected):
             time.sleep(args.sleep_seconds)
@@ -415,6 +531,9 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="List latest Plaud recordings")
     list_parser.add_argument("--limit", type=int, default=10)
     list_parser.set_defaults(func=command_list)
+
+    tags_parser = subparsers.add_parser("tags", help="Fetch Plaud filetag/folder metadata")
+    tags_parser.set_defaults(func=command_tags)
 
     fetch_parser = subparsers.add_parser("fetch", help="Fetch one or more recordings into raw/")
     fetch_parser.add_argument("--limit", type=int, default=1, help="Fetch the latest N done recordings")

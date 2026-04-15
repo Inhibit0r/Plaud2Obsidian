@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from common import (
     ROOT_DIR,
     STATE_DIR,
+    VAULT_DIR,
     WIKI_DIR,
     append_source_block,
     append_unique_bullets,
@@ -29,24 +30,25 @@ from common import (
     sanitize_filename,
     write_json,
 )
+from routing import ensure_default_vault_layout, normalize_relative_folder, suggested_folder_for_type
 
 
-SECTION_PATHS = {
-    "person": WIKI_DIR / "people",
-    "project": WIKI_DIR / "projects",
-    "idea": WIKI_DIR / "ideas",
-    "concept": WIKI_DIR / "ideas",
-    "meeting": WIKI_DIR / "meetings",
-    "synthesis": WIKI_DIR / "synthesis",
+NOTE_TYPE_BY_FOLDER = {
+    "people": "person",
+    "projects": "project",
+    "ideas": "idea",
+    "concepts": "concept",
+    "meetings": "meeting",
+    "synthesis": "synthesis",
 }
 
 INDEX_HEADERS = {
-    "person": "## 👥 Люди (wiki/people/)",
-    "project": "## 🚀 Проекты (wiki/projects/)",
-    "idea": "## 💡 Идеи и концепты (wiki/ideas/)",
-    "concept": "## 💡 Идеи и концепты (wiki/ideas/)",
-    "meeting": "## 📋 Встречи (wiki/meetings/)",
-    "synthesis": "## 🔍 Синтез и анализ (wiki/synthesis/)",
+    "person": "## 👥 Люди (vault/people/)",
+    "project": "## 🚀 Проекты (vault/projects/)",
+    "idea": "## 💡 Идеи (vault/ideas/ + vault/domains/*/ideas/)",
+    "concept": "## 🧩 Концепты (vault/concepts/ + vault/domains/*/concepts/)",
+    "meeting": "## 📋 Встречи (vault/meetings/ + vault/domains/*/meetings/)",
+    "synthesis": "## 🔍 Синтез и анализ (vault/synthesis/)",
 }
 
 
@@ -76,26 +78,62 @@ def load_plan(path: Path) -> dict[str, Any]:
     return data
 
 
-def scan_existing_titles() -> dict[str, dict[str, Path]]:
-    index: dict[str, dict[str, Path]] = {}
-    for note_type, folder in SECTION_PATHS.items():
-        ensure_dir(folder)
-        entries: dict[str, Path] = {}
-        for path in sorted(folder.glob("*.md")):
-            if path.name.startswith("."):
+def _iter_existing_note_paths() -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for root in (VAULT_DIR, WIKI_DIR):
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.md")):
+            if path.name.startswith(".") or path in seen:
                 continue
-            entries[normalize_title_key(path.stem)] = path
-        index[note_type] = entries
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _infer_note_type(path: Path, frontmatter: dict[str, Any]) -> str:
+    note_type = str(frontmatter.get("type") or "").strip()
+    if note_type:
+        return note_type
+    for part in reversed(path.parts):
+        if part in NOTE_TYPE_BY_FOLDER:
+            return NOTE_TYPE_BY_FOLDER[part]
+    return "idea"
+
+
+def scan_existing_titles() -> dict[str, dict[str, Path]]:
+    index: dict[str, dict[str, Path]] = {note_type: {} for note_type in INDEX_HEADERS}
+    for path in _iter_existing_note_paths():
+        frontmatter, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
+        note_type = _infer_note_type(path, frontmatter)
+        index.setdefault(note_type, {})
+        index[note_type][normalize_title_key(path.stem)] = path
     return index
 
 
-def note_path_for(note_type: str, title: str, existing_titles: dict[str, dict[str, Path]]) -> tuple[Path, bool]:
+def resolve_target_folder(note_type: str, note: dict[str, Any], plan: dict[str, Any]) -> str:
+    explicit_folder = normalize_relative_folder(note.get("folder"))
+    if explicit_folder:
+        return explicit_folder
+    routing = plan.get("meta", {}).get("routing", {})
+    tag_names = [str(value).strip() for value in routing.get("plaud_tag_names", []) if str(value).strip()]
+    return suggested_folder_for_type(note_type, tag_names=tag_names)
+
+
+def note_path_for(
+    note_type: str,
+    note: dict[str, Any],
+    existing_titles: dict[str, dict[str, Path]],
+    plan: dict[str, Any],
+) -> tuple[Path, bool]:
+    title = str(note["title"]).strip()
     key = normalize_title_key(title)
     if key in existing_titles.get(note_type, {}):
         return existing_titles[note_type][key], True
-    folder = SECTION_PATHS[note_type]
+    folder = resolve_target_folder(note_type, note, plan)
     filename = sanitize_filename(title) + ".md"
-    return folder / filename, False
+    return VAULT_DIR / folder / filename, False
 
 
 def build_frontmatter(date_value: str, source_link: str, note_type: str, tags: list[str]) -> dict[str, Any]:
@@ -218,6 +256,36 @@ def merge_existing_note(
     return dump_frontmatter(merged_frontmatter) + "\n\n" + body.strip() + "\n"
 
 
+def merge_existing_meeting(path: Path, meeting: dict[str, Any], plan: dict[str, Any]) -> str:
+    existing_frontmatter, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    merged_frontmatter = {
+        "date": existing_frontmatter.get("date") or plan["meta"]["source_date"],
+        "tags": clean_tags(
+            list(existing_frontmatter.get("tags") or []) + list(meeting.get("tags") or []),
+            fallback=["plaud", "meeting"],
+        ),
+        "source": existing_frontmatter.get("source") or plan["meta"]["source_link"],
+        "type": existing_frontmatter.get("type") or "meeting",
+    }
+    body = append_unique_bullets(body, "Participants", [note_link(title) for title in meeting.get("participants", [])])
+    body = append_unique_bullets(body, "Projects", [note_link(title) for title in meeting.get("projects", [])])
+    body = append_unique_bullets(body, "Ideas", [note_link(title) for title in meeting.get("ideas", [])])
+    body = append_unique_bullets(body, "Concepts", [note_link(title) for title in meeting.get("concepts", [])])
+    body = append_unique_bullets(body, "Decisions", meeting.get("decisions", []))
+    body = append_unique_bullets(body, "Tasks", meeting.get("tasks", []))
+    body = append_unique_bullets(body, "Highlights", meeting.get("highlights", []))
+    body = append_unique_bullets(body, "Sources", [plan["meta"]["source_link"]])
+
+    block_heading = f"{plan['meta']['source_date']} — {plan['meta']['source_title'] or meeting['title']}"
+    bullets = []
+    if meeting.get("summary"):
+        bullets.append(meeting["summary"])
+    bullets.extend(meeting.get("highlights", []))
+    bullets.extend(meeting.get("tasks", []))
+    body = append_source_block(body, "Updates", block_heading, bullets or ["Новый источник по этой встрече."])
+    return dump_frontmatter(merged_frontmatter) + "\n\n" + body.strip() + "\n"
+
+
 def ensure_index_entry(index_text: str, header: str, line: str) -> str:
     if line in index_text:
         return index_text
@@ -232,13 +300,17 @@ def ensure_index_entry(index_text: str, header: str, line: str) -> str:
     return prefix + "\n" + line + "\n" + suffix
 
 
-def update_index(created_or_updated: list[tuple[str, str, str]], dry_run: bool) -> None:
+def _relative_note_link(path: Path) -> str:
+    relative = path.relative_to(ROOT_DIR).with_suffix("")
+    return f"[[{relative.as_posix()}]]"
+
+
+def update_index(created_or_updated: list[tuple[str, Path, str]], dry_run: bool) -> None:
     index_path = ROOT_DIR / "index.md"
     index_text = index_path.read_text(encoding="utf-8")
-    for note_type, title, description in created_or_updated:
+    for note_type, path, description in created_or_updated:
         header = INDEX_HEADERS[note_type]
-        folder = SECTION_PATHS[note_type].relative_to(ROOT_DIR)
-        line = f"- [[{folder}/{title}]] — {description}"
+        line = f"- {_relative_note_link(path)} — {description}"
         index_text = ensure_index_entry(index_text, header, line)
     if not dry_run:
         index_path.write_text(index_text, encoding="utf-8")
@@ -260,6 +332,7 @@ def update_log(plan: dict[str, Any], created: list[str], updated: list[str], dry
 
 
 def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool = False) -> WriteResult:
+    ensure_default_vault_layout()
     existing_titles = scan_existing_titles()
     registry = load_registry()
     sources = registry.setdefault("sources", {})
@@ -269,14 +342,14 @@ def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool =
 
     created: list[str] = []
     updated: list[str] = []
-    index_updates: list[tuple[str, str, str]] = []
+    index_updates: list[tuple[str, Path, str]] = []
     meeting_plan = plan.get("meeting") or {}
     context_title = meeting_plan.get("title") or plan["meta"]["source_title"] or plan["meta"]["raw_filename"]
 
     meeting = plan.get("meeting")
     if meeting:
-        meeting_path, exists = note_path_for("meeting", meeting["title"], existing_titles)
-        meeting_markdown = make_meeting_markdown(plan, meeting)
+        meeting_path, exists = note_path_for("meeting", meeting, existing_titles, plan)
+        meeting_markdown = merge_existing_meeting(meeting_path, meeting, plan) if exists else make_meeting_markdown(plan, meeting)
         if not dry_run:
             ensure_dir(meeting_path.parent)
             meeting_path.write_text(meeting_markdown, encoding="utf-8")
@@ -284,15 +357,16 @@ def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool =
             updated.append(meeting["title"])
         else:
             created.append(meeting["title"])
-            existing_titles["meeting"][normalize_title_key(meeting["title"])] = meeting_path
-        index_updates.append(("meeting", meeting["title"], meeting.get("summary", "")[:140].strip() or "Запись встречи из Plaud"))
+            existing_titles.setdefault("meeting", {})[normalize_title_key(meeting["title"])] = meeting_path
+        index_updates.append(("meeting", meeting_path, meeting.get("summary", "")[:140].strip() or "Запись встречи из Plaud"))
 
     for note_type_key, note_type in [("people", "person"), ("projects", "project"), ("ideas", "idea"), ("concepts", "concept")]:
         for note in plan.get(note_type_key, []):
             resolved_title = note.get("existing_title") or note["title"]
-            path, exists = note_path_for(note_type, resolved_title, existing_titles)
             current_note = dict(note)
             current_note["title"] = resolved_title
+            path, exists = note_path_for(note_type, current_note, existing_titles, plan)
+
             if exists:
                 markdown = merge_existing_note(path, note_type, current_note, plan, context_title=context_title)
             else:
@@ -311,10 +385,10 @@ def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool =
                 updated.append(resolved_title)
             else:
                 created.append(resolved_title)
-                existing_titles[note_type][normalize_title_key(resolved_title)] = path
+                existing_titles.setdefault(note_type, {})[normalize_title_key(resolved_title)] = path
 
             summary_text = current_note.get("summary", "")[:140].strip() or "Обновлено из Plaud-источника"
-            index_updates.append((note_type, resolved_title, summary_text))
+            index_updates.append((note_type, path, summary_text))
 
     if not dry_run:
         sources[file_id] = {
@@ -331,7 +405,7 @@ def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool =
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Apply a Plaud ingest plan to wiki/, index.md, and log.md")
+    parser = argparse.ArgumentParser(description="Apply a Plaud ingest plan to vault/, index.md, and log.md")
     parser.add_argument("plan_file", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reprocess", action="store_true")

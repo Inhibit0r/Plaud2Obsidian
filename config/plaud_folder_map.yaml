@@ -1,0 +1,18 @@
+defaults:
+  route_people_globally: true
+  route_projects_globally: true
+  allow_new_folders: true
+
+type_folders:
+  person: people
+  project: projects
+  idea: ideas
+  concept: concepts
+  meeting: meetings
+  synthesis: synthesis
+
+plaud_tag_roots:
+  # Примеры:
+  # Work: domains/work
+  # Personal: domains/personal
+  # Clients: domains/clients

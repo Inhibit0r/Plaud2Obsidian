@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from common import ROOT_DIR, WIKI_DIR, normalize_title_key, parse_frontmatter
+from common import ROOT_DIR, VAULT_DIR, WIKI_DIR, normalize_title_key, parse_frontmatter
+from routing import build_record_routing_context, existing_folder_inventory
 
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_-]{2,}")
@@ -15,6 +16,7 @@ NOTE_TYPE_BY_FOLDER = {
     "people": "person",
     "projects": "project",
     "ideas": "idea",
+    "concepts": "concept",
     "meetings": "meeting",
     "synthesis": "synthesis",
 }
@@ -36,13 +38,20 @@ class WikiNote:
 
 
 def _iter_note_paths() -> list[Path]:
-    if not WIKI_DIR.exists():
-        return []
-    return [
-        path
-        for path in sorted(WIKI_DIR.rglob("*.md"))
-        if not path.name.startswith(".")
-    ]
+    roots: list[Path] = []
+    if VAULT_DIR.exists():
+        roots.append(VAULT_DIR)
+    if WIKI_DIR.exists():
+        roots.append(WIKI_DIR)
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        for path in sorted(root.rglob("*.md")):
+            if path.name.startswith(".") or path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
 
 
 def _summarize_body(body: str, max_chars: int = 320) -> str:
@@ -164,6 +173,8 @@ def build_ingest_context(record: dict[str, Any], limit: int = 8) -> dict[str, An
     return {
         "inventory": inventory_summary(),
         "relevant_notes": [note.to_dict() for note in relevant_notes],
+        "routing": build_record_routing_context(record),
+        "folder_inventory": existing_folder_inventory(),
     }
 
 
@@ -256,4 +267,3 @@ def audit_vault() -> dict[str, Any]:
         "merge_candidates": merge_candidates,
         "recent_log_entries": recent_log_entries(),
     }
-

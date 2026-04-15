@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from common import STATE_DIR, read_json, write_json
 from process_plaud import build_ingest_bundle, load_record, process_raw_file, validate_plan
 from query_wiki import query_wiki
+from routing import routing_snapshot
 from run_ingest import collect_raw_files
 from wiki_context import audit_vault, inventory_summary, recent_log_entries
 from write_wiki import apply_plan
@@ -40,6 +41,7 @@ def run_ingest_operation(args: argparse.Namespace) -> dict[str, object]:
         "operation": "ingest",
         "results": results,
         "inventory": inventory_summary(),
+        "routing": routing_snapshot(),
         "recent_log_entries": recent_log_entries(),
     }
 
@@ -51,6 +53,7 @@ def run_ingest_context_operation(args: argparse.Namespace) -> dict[str, object]:
         "operation": "ingest-context",
         "sources": bundles,
         "inventory": inventory_summary(),
+        "routing": routing_snapshot(),
         "recent_log_entries": recent_log_entries(),
     }
 
@@ -74,6 +77,7 @@ def run_apply_plan_operation(args: argparse.Namespace) -> dict[str, object]:
         "updated": result.updated,
         "skipped": result.skipped,
         "inventory": inventory_summary(),
+        "routing": routing_snapshot(),
         "recent_log_entries": recent_log_entries(),
     }
 
@@ -94,6 +98,7 @@ def run_status_operation(_: argparse.Namespace) -> dict[str, object]:
     return {
         "operation": "status",
         "inventory": inventory_summary(),
+        "routing": routing_snapshot(),
         "recent_log_entries": recent_log_entries(),
     }
 

@@ -22,7 +22,7 @@
 
 - проще в интеграции;
 - меньше moving parts;
-- уже использует `CONTEXT.md`, `AGENTS.md`, `index.md` и релевантные `wiki/` заметки;
+- уже использует `CONTEXT.md`, `AGENTS.md`, `index.md`, routing config и релевантные `vault/` заметки;
 - OpenClaw остаётся управляющим мозгом по таймингу и workflow, но сам ingest-план строится внутри репозитория.
 
 ### Когда переходить на `ingest-context -> apply-plan`
@@ -264,4 +264,3 @@ chmod +x bin/*.sh
 ./bin/openclaw_ingest.sh --latest 1 --dry-run
 ./bin/openclaw_ingest.sh --latest 1
 ```
-

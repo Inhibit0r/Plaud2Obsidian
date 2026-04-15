@@ -56,7 +56,7 @@ python scripts/openclaw_router.py apply-plan --raw-file raw/<file>.json --plan-f
 
 Рекомендуемая схема:
 
-1. Plaud2Obsidian отвечает за Plaud API, обработку raw, запись в `wiki/`, `index.md`, `log.md`.
+1. Plaud2Obsidian отвечает за Plaud API, обработку raw, запись в `vault/`, `index.md`, `log.md`.
 2. OpenClaw отвечает за orchestration и reasoning: когда запускать ingest, когда делать query/lint, как отвечать в Telegram.
 3. Для self-contained режима OpenClaw может вызывать `ingest`.
 4. Для полноценного brain-mode OpenClaw должен использовать `ingest-context -> собственное reasoning -> apply-plan`.

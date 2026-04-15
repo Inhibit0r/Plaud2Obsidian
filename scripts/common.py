@@ -13,6 +13,8 @@ import yaml
 ROOT_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT_DIR / "raw"
 WIKI_DIR = ROOT_DIR / "wiki"
+VAULT_DIR = ROOT_DIR / "vault"
+CONFIG_DIR = ROOT_DIR / "config"
 STATE_DIR = ROOT_DIR / ".state"
 PROMPTS_DIR = ROOT_DIR / "prompts"
 
@@ -182,6 +184,10 @@ def wiki_source_link(raw_filename: str) -> str:
     return f"[[raw/{raw_filename}]]"
 
 
+def raw_source_link(raw_filename: str) -> str:
+    return wiki_source_link(raw_filename)
+
+
 def scan_markdown_titles(folder: Path) -> dict[str, Path]:
     titles: dict[str, Path] = {}
     if not folder.exists():
@@ -201,4 +207,3 @@ def require_env(name: str, fallback_names: list[str] | None = None) -> str:
             return value
     joined = ", ".join(candidates)
     raise RuntimeError(f"Missing required environment variable: {joined}")
-
