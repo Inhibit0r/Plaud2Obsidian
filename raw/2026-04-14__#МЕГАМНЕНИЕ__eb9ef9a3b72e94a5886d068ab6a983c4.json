@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "fetched_at": "2026-04-14T13:14:03Z",
+  "plaud": {
+    "api_domain": "https://api.plaud.ai",
+    "file_id": "eb9ef9a3b72e94a5886d068ab6a983c4",
+    "status": "done"
+  },
+  "name": "#МЕГАМНЕНИЕ",
+  "date": "2026-04-14",
+  "create_time": "",
+  "duration": 3096,
+  "summary": "",
+  "transcript": "",
+  "segments": [],
+  "speakers": []
+}
