@@ -37,6 +37,22 @@ def load_record(path: Path) -> dict[str, Any]:
     return data
 
 
+def transcript_stats(record: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    transcript = str(record.get("transcript", "")).strip()
+    segments = record.get("segments") or []
+    total_segment_chars = sum(len(str(segment.get("text", "")).strip()) for segment in segments)
+    source_chars = total_segment_chars or len(transcript)
+    return {
+        "max_prompt_chars": max_chars,
+        "transcript_chars": len(transcript),
+        "segment_count": len(segments),
+        "segment_text_chars": total_segment_chars,
+        "source_text_chars": source_chars,
+        "will_truncate_for_prompt": source_chars > max_chars,
+        "omitted_prompt_chars_estimate": max(source_chars - max_chars, 0),
+    }
+
+
 def build_transcript_excerpt(record: dict[str, Any], max_chars: int) -> str:
     segments = record.get("segments") or []
     if segments:
@@ -66,13 +82,15 @@ def build_prompt(record: dict[str, Any], raw_filename: str, existing_context: di
     ingest_rules = load_text(PROMPTS_DIR / "plaud_ingest.md")
     max_chars = int(os.getenv("LLM_MAX_SOURCE_CHARS", "22000"))
     transcript_excerpt = build_transcript_excerpt(record, max_chars=max_chars)
+    source_stats = transcript_stats(record, max_chars=max_chars)
     inventory = existing_context.get("inventory", {})
     relevant_notes = existing_context.get("relevant_notes", [])
     routing_context = existing_context.get("routing", {})
     folder_inventory = existing_context.get("folder_inventory", [])
     system_prompt = (
         "Ты аккуратный knowledge-engineering агент. "
-        "Верни только валидный JSON без пояснений и markdown."
+        "Верни только валидный JSON без пояснений и markdown. "
+        "Не добавляй факты, которых нет в предоставленном источнике; если данных недостаточно, не создавай сущность."
     )
     user_prompt = f"""
 {ingest_rules}
@@ -116,6 +134,14 @@ Routing context:
 - duration_seconds: {record.get("duration")}
 - speakers: {record.get("speakers", [])}
 - plaud_tag_names: {record.get("plaud", {}).get("filetag_names", [])}
+
+Source integrity:
+- transcript_chars: {source_stats["transcript_chars"]}
+- segment_count: {source_stats["segment_count"]}
+- segment_text_chars: {source_stats["segment_text_chars"]}
+- prompt_max_chars: {source_stats["max_prompt_chars"]}
+- prompt_truncated: {source_stats["will_truncate_for_prompt"]}
+- omitted_prompt_chars_estimate: {source_stats["omitted_prompt_chars_estimate"]}
 
 Plaud AI summary:
 {record.get("summary", "") or "(empty)"}
@@ -189,6 +215,10 @@ Transcript excerpt:
 
 Дополнительные требования:
 - Не копируй длинные фрагменты транскрипта дословно.
+- Строго опирайся только на Plaud summary, transcript excerpt и предоставленный контекст.
+- Если prompt_truncated=true, не делай вид, что видел весь источник; извлекай только устойчивые темы из видимого фрагмента.
+- Не выдумывай людей, проекты, решения, даты, ссылки, цитаты и причинно-следственные связи.
+- Если сущность не подтверждается текстом, не включай её в JSON.
 - Используй `existing_title`, только если сущность уже есть в vault и это точно тот же объект.
 - Поле `folder` должно быть относительным путём внутри `vault/`.
 - Предпочитай уже существующие папки.
@@ -336,6 +366,10 @@ def validate_plan(plan: dict[str, Any], record: dict[str, Any], raw_filename: st
             "source_date": normalize_date(record.get("date") or record.get("create_time")),
             "file_id": record.get("plaud", {}).get("file_id"),
             "routing": build_record_routing_context(record),
+            "source_integrity": transcript_stats(
+                record,
+                max_chars=int(os.getenv("LLM_MAX_SOURCE_CHARS", "22000")),
+            ),
         },
     }
 

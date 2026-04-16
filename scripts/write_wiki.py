@@ -12,6 +12,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import (
+    RAW_DIR,
     ROOT_DIR,
     STATE_DIR,
     VAULT_DIR,
@@ -28,12 +29,14 @@ from common import (
     read_json,
     render_note,
     sanitize_filename,
+    seconds_to_timestamp,
     write_json,
 )
 from routing import ensure_default_vault_layout, normalize_relative_folder, suggested_folder_for_type
 
 
 NOTE_TYPE_BY_FOLDER = {
+    "raw": "source",
     "people": "person",
     "projects": "project",
     "ideas": "idea",
@@ -43,6 +46,7 @@ NOTE_TYPE_BY_FOLDER = {
 }
 
 INDEX_HEADERS = {
+    "source": "## 📥 Источники (raw/)",
     "person": "## 👥 Люди (vault/people/)",
     "project": "## 🚀 Проекты (vault/projects/)",
     "idea": "## 💡 Идеи (vault/ideas/ + vault/domains/*/ideas/)",
@@ -305,6 +309,62 @@ def _relative_note_link(path: Path) -> str:
     return f"[[{relative.as_posix()}]]"
 
 
+def _render_source_transcript(record: dict[str, Any]) -> str:
+    segments = record.get("segments") or []
+    if segments:
+        lines: list[str] = []
+        for segment in segments:
+            text = str(segment.get("text", "")).strip()
+            if not text:
+                continue
+            speaker = str(segment.get("speaker", "")).strip() or "Speaker"
+            timestamp = seconds_to_timestamp(segment.get("start"))
+            lines.append(f"- [{timestamp}] **{speaker}:** {text}")
+        return "\n".join(lines)
+    return str(record.get("transcript", "")).strip()
+
+
+def ensure_source_note(plan: dict[str, Any], dry_run: bool) -> tuple[Path, str] | None:
+    raw_filename = str(plan.get("meta", {}).get("raw_filename") or "").strip()
+    if not raw_filename:
+        return None
+    raw_path = RAW_DIR / raw_filename
+    record = read_json(raw_path, default={})
+    if not isinstance(record, dict) or not record:
+        return None
+
+    source_title = str(record.get("name") or plan["meta"].get("source_title") or raw_path.stem).strip()
+    source_date = normalize_date(record.get("date") or record.get("create_time") or plan["meta"].get("source_date"))
+    source_note_path = VAULT_DIR / "raw" / f"{sanitize_filename(raw_path.stem)}.md"
+    transcript_text = _render_source_transcript(record)
+    integrity = plan.get("meta", {}).get("source_integrity", {})
+
+    sections = [
+        ("Source Metadata", [
+            f"Plaud file id: {record.get('plaud', {}).get('file_id') or plan['meta'].get('file_id')}",
+            f"Raw file: {raw_filename}",
+            f"Duration seconds: {record.get('duration')}",
+            f"Plaud tags: {', '.join(record.get('plaud', {}).get('filetag_names', []) or []) or 'none'}",
+            f"Transcript chars: {integrity.get('transcript_chars', len(str(record.get('transcript', ''))))}",
+            f"Segments: {integrity.get('segment_count', len(record.get('segments') or []))}",
+        ]),
+        ("Plaud AI Summary", str(record.get("summary", "")).strip() or "(empty)"),
+        ("Full Transcript", transcript_text or "(empty)"),
+    ]
+    frontmatter = {
+        "date": source_date,
+        "tags": ["plaud", "raw-source"],
+        "source": f"[[raw/{raw_filename}]]",
+        "type": "source",
+    }
+    markdown = render_note(frontmatter, source_title, sections)
+    if not dry_run:
+        ensure_dir(source_note_path.parent)
+        source_note_path.write_text(markdown, encoding="utf-8")
+    description = f"Полный Markdown-источник Plaud для записи `{source_title}`."
+    return source_note_path, description
+
+
 def update_index(created_or_updated: list[tuple[str, Path, str]], dry_run: bool) -> None:
     index_path = ROOT_DIR / "index.md"
     index_text = index_path.read_text(encoding="utf-8")
@@ -336,6 +396,10 @@ def apply_plan(plan: dict[str, Any], *, dry_run: bool = False, reprocess: bool =
     existing_titles = scan_existing_titles()
     registry = load_registry()
     sources = registry.setdefault("sources", {})
+    source_note = ensure_source_note(plan, dry_run=dry_run)
+    if source_note:
+        source_path, source_description = source_note
+        update_index([("source", source_path, source_description)], dry_run=dry_run)
     file_id = str(plan["meta"].get("file_id") or plan["meta"]["raw_filename"])
     if file_id in sources and not reprocess:
         return WriteResult(created=[], updated=[], skipped=[file_id])

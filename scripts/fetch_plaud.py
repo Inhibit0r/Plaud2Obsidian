@@ -4,11 +4,13 @@ import argparse
 import gzip
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -147,6 +149,25 @@ def _collapse_text(value: Any) -> str:
     return str(parsed).strip()
 
 
+def _normalize_api_domain(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError("PLAUD_API_DOMAIN must not be empty.")
+
+    # Some copied values end up like: `api.plaud.ai (http://api.plaud.ai/)`.
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
+    if "://" not in raw:
+        raw = f"https://{raw}"
+
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        raise RuntimeError(f"Invalid PLAUD_API_DOMAIN: {value!r}")
+    if any(ch.isspace() for ch in parsed.netloc) or "(" in parsed.netloc or ")" in parsed.netloc:
+        raise RuntimeError(f"Invalid PLAUD_API_DOMAIN host: {parsed.netloc!r}")
+
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+
+
 def _extract_tag_entries(value: Any) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -245,7 +266,7 @@ def _extract_transcript(detail: dict[str, Any], segments: list[dict[str, Any]]) 
 class PlaudClient:
     def __init__(self, token: str, api_domain: str) -> None:
         self.token = token
-        self.api_domain = api_domain.rstrip("/")
+        self.api_domain = _normalize_api_domain(api_domain)
         self.session = requests.Session()
         self.session.headers.update({"Authorization": token})
 
@@ -269,7 +290,9 @@ class PlaudClient:
             return None
         domains = data.get("data", {}).get("domains", {})
         api_domain = str(domains.get("api") or "").strip()
-        return api_domain.rstrip("/") or None
+        if not api_domain:
+            return None
+        return _normalize_api_domain(api_domain)
 
     @staticmethod
     def _extract_list_payload(data: Any) -> list[dict[str, Any]]:
@@ -384,7 +407,7 @@ def load_client() -> PlaudClient:
     api_domain = os.getenv("PLAUD_API_DOMAIN")
     if not token or not api_domain:
         raise RuntimeError("PLAUD_TOKEN and PLAUD_API_DOMAIN must be set in .env")
-    return PlaudClient(token=token, api_domain=api_domain)
+    return PlaudClient(token=token, api_domain=_normalize_api_domain(api_domain))
 
 
 def build_raw_recording(

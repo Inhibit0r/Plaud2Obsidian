@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  ./bin/openclaw_ingest_next.sh [--latest N | --file-id ID | --raw-file PATH] [--dry-run] [--prepare-only]
+  ./bin/openclaw_ingest_next.sh [--latest N | --file-id ID | --raw-file PATH] [--dry-run] [--prepare-only] [--refresh-raw] [--reprocess]
 
 Examples:
   ./bin/openclaw_ingest_next.sh
@@ -28,6 +28,8 @@ MODE="latest"
 MODE_VALUE="1"
 DRY_RUN="0"
 PREPARE_ONLY="0"
+REFRESH_RAW="0"
+REPROCESS="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,6 +50,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN="1"
+      shift
+      ;;
+    --refresh-raw)
+      REFRESH_RAW="1"
+      shift
+      ;;
+    --reprocess)
+      REPROCESS="1"
       shift
       ;;
     --prepare-only)
@@ -89,6 +99,10 @@ case "${MODE}" in
     CONTEXT_ARGS=(--raw-file "${MODE_VALUE}")
     ;;
 esac
+
+if [[ "${REFRESH_RAW}" == "1" ]]; then
+  CONTEXT_ARGS+=(--refresh-raw)
+fi
 
 ./bin/openclaw_ingest_context.sh "${CONTEXT_ARGS[@]}" > "${CONTEXT_FILE}"
 
@@ -153,6 +167,9 @@ RAW_FILE="$(cat "${RAW_REF_FILE}")"
 APPLY_ARGS=(--raw-file "${RAW_FILE}" --plan-file "${PLAN_FILE}")
 if [[ "${DRY_RUN}" == "1" ]]; then
   APPLY_ARGS+=(--dry-run)
+fi
+if [[ "${REPROCESS}" == "1" ]]; then
+  APPLY_ARGS+=(--reprocess)
 fi
 
 ./bin/openclaw_apply_plan.sh "${APPLY_ARGS[@]}"
