@@ -1,8 +1,16 @@
 .env
 .env.local
+.env.save
 .state/
+.venv/
+.codex/
+.openclaw/
 __pycache__/
 *.pyc
 *.pyo
 *.DS_Store
-
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md

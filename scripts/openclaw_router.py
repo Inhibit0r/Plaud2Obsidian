@@ -49,13 +49,25 @@ def run_ingest_operation(args: argparse.Namespace) -> dict[str, object]:
 def run_ingest_context_operation(args: argparse.Namespace) -> dict[str, object]:
     raw_files = collect_raw_files(args)
     bundles = [build_ingest_bundle(raw_file) for raw_file in raw_files]
-    return {
+    result: dict[str, object] = {
         "operation": "ingest-context",
         "sources": bundles,
         "inventory": inventory_summary(),
         "routing": routing_snapshot(),
         "recent_log_entries": recent_log_entries(),
     }
+    if len(bundles) == 1:
+        bundle = bundles[0]
+        record = bundle.get("record", {})
+        result.update(
+            {
+                "raw_file": bundle.get("raw_file"),
+                "raw_filename": bundle.get("raw_filename"),
+                "source_title": record.get("name"),
+                "file_id": record.get("plaud", {}).get("file_id"),
+            }
+        )
+    return result
 
 
 def run_apply_plan_operation(args: argparse.Namespace) -> dict[str, object]:
